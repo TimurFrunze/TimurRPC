@@ -1,0 +1,2 @@
+# TimurLoggingModule
+使用golang进行实现，允许日志提交和写入操作异步解耦，提供优雅关闭的轻量化日志框架
