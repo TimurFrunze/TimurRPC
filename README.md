@@ -1,2 +1,2 @@
-# TimurLoggingModule
-使用golang进行实现，允许日志提交和写入操作异步解耦，提供优雅关闭的轻量化日志框架
+# TimurRPC
+使用golang进行实现的可扩展RPC框架
