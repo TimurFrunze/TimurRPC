@@ -31,6 +31,16 @@ func (l *TestLogger) Log(msg string) error {
 
 type Signal struct{}
 
+func tryPop(q *gqueue.Queue) (item any, ok bool) {
+	select {
+	case item, ok = <-q.C:
+		return item, ok
+	default:
+		return nil, true
+
+	}
+}
+
 type TimurLogger struct {
 	batchSize       int
 	closeSignalSize int
@@ -61,7 +71,12 @@ func writeAll(result *TimurLogger) (_ok_ bool, _err error) {
 		//说明日志模块已经关闭，最终返回false
 		//将全部的日志取出并写入文件
 		for {
-			logMsg := result.q.Pop()
+			//需要select实现非阻塞弹出
+			logMsg, __ok := tryPop(result.q)
+			if !__ok {
+				//说明通道异常关闭，直接panic
+				panic("logger queue channel is closed")
+			}
 			if logMsg == nil {
 				break
 			}
@@ -70,18 +85,19 @@ func writeAll(result *TimurLogger) (_ok_ bool, _err error) {
 			}
 		}
 		return false, nil
-	default:
-		//日志模块没有被关闭时，需要等待signals通道中的信号激活后台协程
-		var sig Signal
-		var _sign bool
-		sig, _sign = <-result.signals
+	case sig, _sign := <-result.signals:
 		if !_sign {
 			//说明信号通道异常关闭，直接panic
 			panic("logger signals channel is closed")
 		}
 		//将全部的日志取出并写入文件
 		for {
-			logMsg := result.q.Pop()
+			//需要select实现非阻塞弹出
+			logMsg, __ok := tryPop(result.q)
+			if !__ok {
+				//说明通道异常关闭，直接panic
+				panic("logger queue channel is closed")
+			}
 			if logMsg == nil {
 				break
 			}
@@ -103,7 +119,6 @@ func writeAll(result *TimurLogger) (_ok_ bool, _err error) {
 				return true, nil
 			}
 		}
-		sig = Signal{}
 		select {
 		case result.signals <- sig:
 		default:
@@ -135,7 +150,9 @@ func (l *TimurLogger) Close() (_err_ error) {
 	default:
 	}
 	//等待后台协程处理结束
+	fmt.Println("close logger, waiting...")
 	l.guard.Wait()
+	fmt.Println("background goroutine closed")
 	//清理资源
 	close(l.signals)
 	close(l.closeSignal)
@@ -216,7 +233,6 @@ func NewTimurLogger(filename string, maxSizeMB int, maxBackups int, maxAgeDays i
 	}
 	result.isClosed.Store(false)
 	result.guard.Add(1)
-	result.signals <- Signal{} //添加初始信号，触发后台协程运行
 	//创建后台异步写入协程
 	go func() {
 		defer func() {
