@@ -11,6 +11,7 @@ import (
 )
 
 var defaultBatchSize int = 10000
+var defaultCloseSignalSize int = 10
 
 type LoggerInterface interface {
 	Log(msg string) (_err_ error)
@@ -31,71 +32,113 @@ func (l *TestLogger) Log(msg string) error {
 type Signal struct{}
 
 type TimurLogger struct {
-	batchSize  int
-	logger     *lumberjack.Logger
-	fileWriter *log.Logger
-	q          *gqueue.Queue
-	isClosed   atomic.Bool
-	signals    chan Signal
-	guard      sync.WaitGroup //发出结束申请后，需要等待后台协程结束后才可以关闭和清理资源
+	batchSize       int
+	closeSignalSize int
+	logger          *lumberjack.Logger
+	fileWriter      *log.Logger
+	q               *gqueue.Queue
+	isClosed        atomic.Bool
+	signals         chan Signal
+	closeSignal     chan Signal
+	guard           sync.WaitGroup //发出结束申请后，需要等待后台协程结束后才可以关闭和清理资源
 }
 
-// func writeAll(result *TimurLogger, signal Signal, sign bool) {
-// 	//没有关闭则取出全部日志并逐一写入
-// 	for {
-// 		logMsg := result.q.Pop()
-// 		if logMsg == nil {
-// 			break
-// 		}
-// 		if msg, ok := logMsg.(string); ok {
-// 			result.fileWriter.Println(msg)
-// 		}
-// 		if result.q.Len() == 0 {
-// 			break
-// 		}
-// 	}
-// 	//将队列中的信号全部清空，然后再放入一个信号，防止因为通道满，无法继续添加新信号而无法持续触发
-// 	for {
-// 		select {
-// 		case <-result.signals:
-// 			continue
-// 		default:
-// 			func() {
-// 				if sign {
-// 					result.signals <- signal
-// 				}
-// 			}()
-// 			return
-// 		}
-// 	}
-// }
-
-func (l *TimurLogger) processSignal() bool {
-	//非阻塞函数，信号通道不满时直接返回false，只有信号通道满时返回true
-	for i := 0; i < l.batchSize; i++ {
-		select {
-		case <-l.signals:
-			continue
-		default:
-			return false
+func writeAll(result *TimurLogger) (_ok_ bool, _err error) {
+	/*
+		_ok_ : 用来表示是否接收到停止信号，为false表示接收到停止信号
+		_err : 用来表示是否发生了panic
+		后台协程通过返回值判断是否为最后一轮处理，如果为最后一轮（返回值为false）则直接退出
+	*/
+	defer func() {
+		if r := recover(); r != nil {
+			_ok_ = false
+			_err = fmt.Errorf("recover from panic: %v while writing all logs", r)
 		}
+	}()
+	//closeSignal通道和signals通道都可以激活后台协程
+	select {
+	case <-result.closeSignal:
+		//说明日志模块已经关闭，最终返回false
+		//将全部的日志取出并写入文件
+		for {
+			logMsg := result.q.Pop()
+			if logMsg == nil {
+				break
+			}
+			if msg, ok := logMsg.(string); ok {
+				result.fileWriter.Println(msg)
+			}
+		}
+		return false, nil
+	default:
+		//日志模块没有被关闭时，需要等待signals通道中的信号激活后台协程
+		var sig Signal
+		var _sign bool
+		sig, _sign = <-result.signals
+		if !_sign {
+			//说明信号通道异常关闭，直接panic
+			panic("logger signals channel is closed")
+		}
+		//将全部的日志取出并写入文件
+		for {
+			logMsg := result.q.Pop()
+			if logMsg == nil {
+				break
+			}
+			if msg, ok := logMsg.(string); ok {
+				result.fileWriter.Println(msg)
+			}
+		}
+		//将signals通道中的信号清除，并判断是否产生拥塞
+		for i := 0; i < result.batchSize; i++ {
+			select {
+			case sig, _sign = <-result.signals:
+				if !_sign {
+					//后台协程还未结束，通道就被异常关闭
+					panic("logger signals channel is closed")
+				}
+				continue
+			default:
+				//还未执行到batchSize次，说明信号队列没有发生拥塞
+				return true, nil
+			}
+		}
+		sig = Signal{}
+		select {
+		case result.signals <- sig:
+		default:
+		}
+		return true, nil
 	}
-	return true
 }
 
 func (l *TimurLogger) Close() (_err_ error) {
+	/*
+		关闭流程：
+		1.主协程将isClosed设为false，并添加信号到closeSignal通道，先禁止其他协程继续添加日志，再激活后台协程处理
+		2.在此之后，主协程和其他协程无法继续添加日志
+		3.主协程等待后台协程结束处理
+	*/
 	defer func() {
 		if r := recover(); r != nil {
 			_err_ = fmt.Errorf("recover from panic: %v while closing logger", r)
 		}
 	}()
-	//先将isClosed设为false并通过信号通道激活提醒
+	//先判断是否已经关闭
+	if l.isClosed.Load() {
+		return fmt.Errorf("logger is closed")
+	}
+	//先将isClosed设为true并通过信号通道激活提醒后台协程，isClosed给生产者看，closeSignal给后台协程看
 	l.isClosed.Store(true)
-
+	select {
+	case l.closeSignal <- Signal{}:
+	default:
+	}
 	//等待后台协程处理结束
 	l.guard.Wait()
 	//清理资源
 	close(l.signals)
+	close(l.closeSignal)
 	l.q.Close()
 	return l.logger.Close()
 }
@@ -118,7 +161,23 @@ func (l *TimurLogger) Log(msg string) (_err_ error) {
 	return nil
 }
 
-func NewTimurLogger(filename string, maxSizeMB int, maxBackups int, maxAgeDays int, compress bool, localTime bool, batchSize int) (timur *TimurLogger, _err_ error) {
+func (l *TimurLogger) Info(msg string) error {
+	return l.Log("INFO: " + msg)
+}
+
+func (l *TimurLogger) Debug(msg string) error {
+	return l.Log("DEBUG: " + msg)
+}
+
+func (l *TimurLogger) Warn(msg string) error {
+	return l.Log("WARN: " + msg)
+}
+
+func (l *TimurLogger) Error(msg string) error {
+	return l.Log("ERROR: " + msg)
+}
+
+func NewTimurLogger(filename string, maxSizeMB int, maxBackups int, maxAgeDays int, compress bool, localTime bool, batchSize int, closeSignalSize int) (timur *TimurLogger, _err_ error) {
 	defer func() {
 		if r := recover(); r != nil {
 			_err_ = fmt.Errorf("recover from panic: %v", r)
@@ -133,7 +192,7 @@ func NewTimurLogger(filename string, maxSizeMB int, maxBackups int, maxAgeDays i
 		Compress:   compress,
 		LocalTime:  localTime,
 	}
-	fileWriter := log.New(logger, "", log.LstdFlags)
+	fileWriter := log.New(logger, "", log.LstdFlags|log.Lmicroseconds)
 	q := gqueue.New()
 	if q == nil {
 		return nil, fmt.Errorf("queue is nil")
@@ -141,14 +200,19 @@ func NewTimurLogger(filename string, maxSizeMB int, maxBackups int, maxAgeDays i
 	if batchSize < defaultBatchSize {
 		batchSize = defaultBatchSize
 	}
+	if closeSignalSize < defaultCloseSignalSize {
+		closeSignalSize = defaultCloseSignalSize
+	}
 	result := &TimurLogger{
-		batchSize:  batchSize,
-		logger:     logger,
-		fileWriter: fileWriter,
-		q:          q,
-		isClosed:   atomic.Bool{},
-		signals:    make(chan Signal, batchSize),
-		guard:      sync.WaitGroup{},
+		batchSize:       batchSize,
+		closeSignalSize: closeSignalSize,
+		logger:          logger,
+		fileWriter:      fileWriter,
+		q:               q,
+		isClosed:        atomic.Bool{},
+		signals:         make(chan Signal, batchSize),
+		closeSignal:     make(chan Signal, closeSignalSize),
+		guard:           sync.WaitGroup{},
 	}
 	result.isClosed.Store(false)
 	result.guard.Add(1)
@@ -161,22 +225,18 @@ func NewTimurLogger(filename string, maxSizeMB int, maxBackups int, maxAgeDays i
 				fileWriter.Printf("logger background goroutine recover from panic: %v", r)
 			}
 			result.guard.Done()
+			/*
+				主协程close先将原子标识设为true，并向closeSignal通道中添加一个新信号，前者防止其他协程添加信号，后者通知后台协程结束
+				通知主协程后台协程结束，只有在后台协程结束后，主协程中close函数才能开始关闭通道和清理资源
+			*/
 		}()
 		for {
-			// signal := <-result.signals
-			//查看是否已经关闭
-			if result.isClosed.Load() {
-				//关闭则进行最后一次检查和清理
-				// writeAll(result, signal, false)
-				break
+			ok, err := writeAll(result)
+			if err != nil {
+				fmt.Println(err)
 			}
-			//批量处理全部信号，但是只有在信号占满时才再移除后再加入一个信号，防止因为通道长度有限而漏处理加入的日志
-			// flag := true
-			for i := 0; i < result.batchSize; i++ {
-				select {
-				case <-result.signals:
-
-				}
+			if !ok {
+				break
 			}
 		}
 	}()
