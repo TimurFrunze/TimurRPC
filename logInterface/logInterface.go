@@ -3,6 +3,7 @@ package logInterface
 import (
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 
@@ -150,9 +151,9 @@ func (l *TimurLogger) Close() (_err_ error) {
 	default:
 	}
 	//等待后台协程处理结束
-	fmt.Println("close logger, waiting...")
+	// fmt.Println("close logger, waiting...")
 	l.guard.Wait()
-	fmt.Println("background goroutine closed")
+	// fmt.Println("background goroutine closed")
 	//清理资源
 	close(l.signals)
 	close(l.closeSignal)
@@ -201,6 +202,10 @@ func NewTimurLogger(filename string, maxSizeMB int, maxBackups int, maxAgeDays i
 			timur = nil
 		}
 	}()
+	//检验文件是否存在，或者是否可以创建
+	if _, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err != nil {
+		panic(fmt.Sprintf("OpenFile failed, with err != nil: %v", err))
+	}
 	logger := &lumberjack.Logger{
 		Filename:   filename,
 		MaxSize:    maxSizeMB,
@@ -212,7 +217,7 @@ func NewTimurLogger(filename string, maxSizeMB int, maxBackups int, maxAgeDays i
 	fileWriter := log.New(logger, "", log.LstdFlags|log.Lmicroseconds)
 	q := gqueue.New()
 	if q == nil {
-		return nil, fmt.Errorf("queue is nil")
+		return nil, fmt.Errorf("gqueue.New() failed, with q == nil")
 	}
 	if batchSize < defaultBatchSize {
 		batchSize = defaultBatchSize
