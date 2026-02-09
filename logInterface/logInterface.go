@@ -33,6 +33,11 @@ func (l *TestLogger) Log(msg string) error {
 type Signal struct{}
 
 func tryPop(q *gqueue.Queue) (item any, ok bool) {
+	/*
+		gqueue.Queue的非阻塞Pop操作，当返回item为nil时，说明队列为空；第二个返回值ok用来说明队列是否已经关闭
+		params: q: 需要进行非阻塞弹出的队列
+		returns: item: 弹出的元素，ok: 队列是否已经关闭
+	*/
 	select {
 	case item, ok = <-q.C:
 		return item, ok
@@ -48,17 +53,18 @@ type TimurLogger struct {
 	logger          *lumberjack.Logger
 	fileWriter      *log.Logger
 	q               *gqueue.Queue
-	isClosed        atomic.Bool
-	signals         chan Signal
-	closeSignal     chan Signal
+	isClosed        atomic.Bool    //用来告知生产者，日志模块已经关闭
+	signals         chan Signal    //用来通知后台消费者，有新的日志需要写入文件
+	closeSignal     chan Signal    //用来通知后台消费者，日志模块已经关闭，可以进行清理和退出
 	guard           sync.WaitGroup //发出结束申请后，需要等待后台协程结束后才可以关闭和清理资源
 }
 
 func writeAll(result *TimurLogger) (_ok_ bool, _err error) {
 	/*
-		_ok_ : 用来表示是否接收到停止信号，为false表示接收到停止信号
-		_err : 用来表示是否发生了panic
-		后台协程通过返回值判断是否为最后一轮处理，如果为最后一轮（返回值为false）则直接退出
+		后台协程核心功能：通过signals(有新日志到来，需要进行处理）和closeSignal(日志模块已经被创建者关闭)两个通道来激活后台协程，进行不同种类的处理。前者仅仅将全部日志写入文件，后者将全部日志写入文件后返回false，告知后台协程结束。
+			_ok_ : 用来表示是否接收到停止信号，为false表示接收到停止信号
+			_err : 用来表示是否发生了panic
+			后台协程通过返回值判断是否为最后一轮处理，如果为最后一轮（返回值为false）则直接退出
 	*/
 	defer func() {
 		if r := recover(); r != nil {
@@ -78,7 +84,7 @@ func writeAll(result *TimurLogger) (_ok_ bool, _err error) {
 				//说明通道异常关闭，直接panic
 				panic("logger queue channel is closed")
 			}
-			if logMsg == nil {
+			if logMsg == nil { //日志已经全部取出，退出循环
 				break
 			}
 			if msg, ok := logMsg.(string); ok {
@@ -120,6 +126,7 @@ func writeAll(result *TimurLogger) (_ok_ bool, _err error) {
 				return true, nil
 			}
 		}
+		//取出信号花费了batchSize次，说明信号队列可能发生拥塞导致部分携程放弃写入信号，需要主动添加一个信号来多进行一次判断
 		select {
 		case result.signals <- sig:
 		default:
@@ -150,10 +157,8 @@ func (l *TimurLogger) Close() (_err_ error) {
 	case l.closeSignal <- Signal{}:
 	default:
 	}
-	//等待后台协程处理结束
-	// fmt.Println("close logger, waiting...")
+	//等待后台协程清理完剩下的日志并结束
 	l.guard.Wait()
-	// fmt.Println("background goroutine closed")
 	//清理资源
 	close(l.signals)
 	close(l.closeSignal)
@@ -173,8 +178,9 @@ func (l *TimurLogger) Log(msg string) (_err_ error) {
 	}
 	//正常添加日志并告知后台协程
 	l.q.Push(msg)
-	if len(l.signals) < cap(l.signals) {
-		l.signals <- Signal{}
+	select {
+	case l.signals <- Signal{}:
+	default:
 	}
 	return nil
 }
@@ -202,9 +208,23 @@ func NewTimurLogger(filename string, maxSizeMB int, maxBackups int, maxAgeDays i
 			timur = nil
 		}
 	}()
+
 	//检验文件是否存在，或者是否可以创建
-	if _, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err != nil {
-		panic(fmt.Sprintf("OpenFile failed, with err != nil: %v", err))
+	fileOpenErr := func() (_e error) {
+		defer func() {
+			if r := recover(); r != nil {
+				_e = fmt.Errorf("recover from panic: %v while opening log file", r)
+			}
+		}()
+		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			panic(fmt.Sprintf("OpenFile failed, with err != nil: %v", err))
+		}
+		defer file.Close()
+		return nil
+	}()
+	if fileOpenErr != nil {
+		panic(fileOpenErr)
 	}
 	logger := &lumberjack.Logger{
 		Filename:   filename,
